@@ -1,152 +1,242 @@
-# Previsão de Enchentes e Impacto em Leitos Hospitalares
+# Previsão de Leitos Hospitalares sob Risco de Enchentes
 
-Relatório de evolução da aplicação de **Deep Learning** e **Modelos Tabulares** na previsão de eventos de enchente e na análise de impacto sobre a oferta de leitos hospitalares no Brasil (2010–2025).
+**Pesquisa aberta** que estima, *ex-ante*, quantos **leitos hospitalares** serão necessários
+(demanda, ocupação e *surge capacity*) em hospitais-escola durante eventos de enchente —
+começando pelo **Rio Grande do Sul** e escalando para o **Brasil**.
 
-O projeto evoluiu em **4 fases principais**, partindo de um protótipo regional no Rio Grande do Sul até uma auditoria nacional *out-of-time* cruzando dados meteorológicos (INMET), uso do solo (MapBiomas), decretos de desastres (SEDEC), demografia (IBGE), capacidade hospitalar por especialidade (CNES) e número de internações reais (SIH/SUS).
+O repositório entrega um pipeline reproduzível de ponta a ponta: ingestão com LGPD,
+hidrologia calibrada, modelos probabilísticos de demanda, simulação de filas, auditoria
+contrafactual e — desde a `v1.3.0` — **um comando único** que roda 13 modelos em 4 alvos,
+compara leitos observados e preditos e emite um relatório em PDF.
 
----
+[![CI](https://github.com/eduardorwll/Previsao-de-leitos/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/eduardorwll/Previsao-de-leitos/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/badge/release-v1.3.0-0f766e)](https://github.com/eduardorwll/Previsao-de-leitos/releases/tag/v1.3.0)
+[![Python](https://img.shields.io/badge/python-3.12-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![uv](https://img.shields.io/badge/managed%20by-uv-DE5FE9)](https://docs.astral.sh/uv/)
+[![Ruff](https://img.shields.io/badge/lint-ruff-261230)](https://docs.astral.sh/ruff/)
+[![mypy](https://img.shields.io/badge/types-mypy%20strict-2A6DB2)](https://mypy-lang.org/)
+[![Coverage](https://img.shields.io/badge/coverage-84.9%25-brightgreen)](#qualidade-e-reprodutibilidade)
+[![License: MIT](https://img.shields.io/badge/license-MIT-3DA639)](LICENSE)
 
-## Variáveis Utilizadas na Previsão de Enchentes
-
-Os modelos de previsão hidrológica utilizam uma janela temporal de **15 dias** composta por:
-
-* **Clima e Hidrologia (dinâmicas):** precipitação diária, precipitação máxima horária, precipitação acumulada (3, 7 e 15 dias), índice de saturação do solo (`API`), escoamento efetivo (relação entre chuva, impermeabilização e saturação), temperatura (média e máxima), umidade relativa média, pressão atmosférica média e sazonalidade cíclica ($\sin/\cos$ do dia do ano, na escala nacional).
-* **Uso do Solo e Geografia (estáticas):** índice de impermeabilização urbana, índice de retenção vegetal, altitude da estação e, na escala nacional, coordenadas geográficas (`latitude`/`longitude`) + `UF Embedding`.
-
----
-
-## 1ª Fase — Combate ao *Overfitting* e à Inversão Causal (Recorte RS)
-
-Nos experimentos iniciais no Rio Grande do Sul, foram identificados dois gargalos estruturais:
-
-* **Memorização espacial (`mun_embedding`):** Cada município possuía um vetor treinável próprio, que a rede usava como atalho para memorizar o histórico de alagamentos da cidade, elevando o risco mesmo sem indícios climáticos. A solução foi remover o `mun_embedding`.
-* **Inversão causal (`lambda_pinn`):** Penalidades suaves adicionadas à função de perda para punir inversões na impermeabilização degradavam o desempenho preditivo sem garantir coerência física. A solução foi substituir a penalidade por uma **restrição estrutural rígida** com pesos estritamente positivos (`F.softplus`).
-
-### Arquitetura desenvolvida: `HydroFiLMMonotonicNet`
-
-Arquitetura em PyTorch projetada especificamente para o projeto, dividida em três blocos:
-
-* **Hydro:** Uma **Bi-GRU** de 2 camadas lê a janela de 15 dias nos dois sentidos para capturar a evolução da tempestade e o encharcamento do solo. Em seguida, uma camada de **Multi-Head Self-Attention** pondera quais dias mais contribuem para o risco atual, gerando o *logit* climático base (`base_logits`) e a estimativa de severidade (`severity_head`).
-* **FiLM (*Feature-wise Linear Modulation*):** Usa a altitude da estação para gerar dois vetores ($\gamma$ e $\beta$) que modulam as ativações da Bi-GRU, adaptando a leitura da chuva ao relevo sem decorar municípios.
-* **Monotonic (Ramo Monotônico Estrutural):** Em vez de penalidades na *loss*, o uso do solo entra em um ramo paralelo com pesos forçados a serem estritamente positivos via `F.softplus`. Isso garante matematicamente que aumentar a impermeabilização nunca reduza o risco e aumentar a vegetação nunca o eleve.
-
-### Resultados — RS (Treino: `2010–2023` | Calibração: `2024` | Teste: `2025`)
-
-A `HydroFiLMMonotonicNet` superou o `TabFM (MITRA)` em todas as métricas factuais:
-
-| Modelo (RS — Teste 2025) | ROC-AUC | PR-AUC | Brier Score |
-| :--- | :---: | :---: | :---: |
-| **HydroFiLMMonotonicNet (PyTorch)** | **0.7585** | **0.0508** | **0.00766** |
-| TabFM (MITRA) | 0.6218 | 0.0170 | 0.00781 |
+> **Fronteira clínica e operacional.** Este repositório é de **pesquisa e avaliação
+> metodológica**. Modelos e relatórios **não** são recomendação clínica, triagem,
+> regulação de vagas ou alerta em tempo real — *Not for patient care or live clinical use*.
 
 ---
 
-## 2ª Fase — Escala Nacional com `HydroTFTNet`
+## Sumário
 
-Na segunda fase, o experimento foi expandido para **todo o Brasil** (`~2,5 milhões` de dias-município, `571` municípios e `27` UFs), comparando o **`HydroTFTNet`** (com o mesmo Ramo Monotônico Estrutural) contra o **`TabFM (MITRA)`**.
-
-O `HydroTFTNet` foi adotado nessa escala por combinar:
-* **Variable Selection Network (VSN):** calcula pesos dinâmicos para selecionar quais variáveis climáticas mais importam em cada região/bioma.
-* **LSTM condicionada geograficamente:** mantém um estado de memória separado (`cell state`) inicializado a partir do contexto geográfico (`UF Embedding`, latitude, longitude e altitude).
-
-### Principais otimizações de engenharia
-
-* **Limite de contexto do TabFM (MITRA):** Por utilizar atenção quadrática $O(N^2)$ entre linhas, o MITRA precisou ser limitado a **8.000 amostras** de contexto (selecionadas com *Hard Negative Mining*) para não estourar a VRAM da GPU.
-* **Dataset 2D Indexado:** Em vez de materializar um tensor 3D completo em memória (~1,7 GB), os dados passaram a ser armazenados em uma matriz 2D (~110 MB) e fatiados em janelas de 15 dias sob demanda no `__getitem__`.
-* **Sazonalidade cíclica (`doy_sin`, `doy_cos`):** Permitiu diferenciar chuvas em estações chuvosas de chuvas isoladas em períodos secos nos diferentes biomas brasileiros.
-* **Balanceamento e Early Stopping:** Uso de `WeightedRandomSampler` (~8% de positivos por *batch*), `OneCycleLR` e **Early Stopping** monitorando o PR-AUC de validação (2024) para conter o *overfitting* do Transformer.
-
-### Resultados — Brasil Inteiro (Teste Out-of-Time 2025)
-
-| Modelo (Brasil — Teste 2025) | ROC-AUC | PR-AUC |
-| :--- | :---: | :---: |
-| **HydroTFTNet Nacional (Monotônico)** | **0.8834** | **0.0328** |
-| TabFM (MITRA) | 0.8762 | 0.0255 |
-
-> **Conclusão arquitetural:** A `HydroFiLMMonotonicNet` (Bi-GRU) performa melhor em datasets menores (recorte estadual), evitando *overfitting*; já o `HydroTFTNet` se sobressai em escala nacional, aproveitando o grande volume de dados e a diversidade climática.
+- [Destaques](#destaques)
+- [Início rápido](#início-rápido)
+- [Benchmark em um comando](#benchmark-em-um-comando)
+- [Arquitetura](#arquitetura)
+- [Tecnologias](#tecnologias)
+- [Dados, privacidade e holdout](#dados-privacidade-e-holdout)
+- [Qualidade e reprodutibilidade](#qualidade-e-reprodutibilidade)
+- [Documentação](#documentação)
+- [Citação](#citação)
+- [Licença](#licença)
 
 ---
 
-## 3ª Fase — Cruzamento com Leitos Hospitalares (CNES + IBGE) e Auditoria de 2024
+## Destaques
 
-Na terceira fase, os dados climáticos e as previsões do `HydroTFTNet` (treinado estritamente em `2010–2023`) foram cruzados com a oferta mensal de leitos por especialidade (**CNES**, removendo colunas binárias de indicadores), população municipal (**IBGE**) e área territorial (**MapBiomas**).
-
-### Principais avanços
-
-* **Normalização demográfica e territorial:** Cálculo de leitos por **1.000 habitantes** e por **100 km²**, eliminando distorções entre cidades pequenas e polos regionais.
-* **Auditoria da enchente de 2024 (`HydroTFTNet`):** O modelo previu com precisão o pico da catástrofe de maio de 2024 no RS (**ROC-AUC `0.8196`** e **PR-AUC `0.3133`** em maio/2024). Em meses sem decretos oficiais da SEDEC, o índice observado (`Nivel_Alag_Real`) permanece em `0.000`, enquanto o modelo continua sinalizando severidade contínua quando há chuvas fortes.
-* **Previsão de leitos via Delta Mensal (`HistGradientBoostingRegressor`):** Um modelo tabular dedicado foi treinado em `2010–2023` para prever a **variação mensal de leitos** ($\Delta_t = y_t - y_{t-1}$) com perda L1 (`absolute_error`), eliminando o viés de subestimação nos polos regionais ($R^2 > 0.9995$ e MAE entre `0.15` e `0.31` leitos). Comparar a oferta prevista com a real isolou o choque emergencial de **+163 UTIs** em maio/2024 e a desmobilização de **-111 UTIs** em julho/2024 no RS.
-
-### RS 2024 Mês a Mês: Enchente e Leitos (Previsto vs. Real)
-
-| Mês | Prob. Enchente (Prev) | Nível Alag. (Prev) | Nível Alag. (Real) | Leitos Clín. (Prev) | Leitos Clín. (Real) | Leitos UTI (Prev) | Leitos UTI (Real) | Leitos Clín. / 1.000 hab |
-| :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| 1 | 0.006 | 1.845 | 0.489 | 4990.0 | 4997 | 1955.0 | 1955 | 1.108 |
-| 2 | 0.006 | 1.074 | 0.000 | 5172.0 | 5216 | 2036.0 | 2145 | 1.119 |
-| 3 | 0.008 | 2.251 | 0.425 | 5272.0 | 5229 | 2203.3 | 2193 | 1.108 |
-| 4 | 0.012 | 4.806 | 4.157 | 5229.0 | 5407 | 2193.0 | 2204 | 1.114 |
-| **5** | **0.021** | **6.578** | **5.470** | **5493.0** | **5550** | **2224.0** | **2387** | **1.159** |
-| 6 | 0.010 | 3.883 | 0.060 | 5550.0 | 5649 | 2388.5 | 2388 | 1.173 |
-| 7 | 0.005 | 0.156 | 0.000 | 5649.0 | 5624 | 2388.0 | 2277 | 1.166 |
-| 8 | 0.010 | 3.154 | 0.000 | 5624.0 | 5666 | 2277.0 | 2282 | 1.165 |
-| 9 | 0.013 | 3.739 | 0.691 | 5584.0 | 5593 | 2254.0 | 2268 | 1.189 |
-| 10 | 0.021 | 4.435 | 0.487 | 5593.0 | 5573 | 2268.0 | 2278 | 1.183 |
-| 11 | 0.013 | 2.322 | 0.000 | 5573.0 | 5624 | 2278.0 | 2241 | 1.186 |
+| Frente | Resultado auditado |
+| :--- | :--- |
+| **Demanda de leitos (`F04.1`)** | `MAE 3,51` leitos/dia em UTI adulto (`RS 2024`), `MASE 0,984` vs. persistência |
+| **Hidrologia (`F03.1`)** | `ROC-AUC 0,789`, `BSS +0,156` em grade `0,1°` anti-*MAUP* (OOF real na RX 7600 / ROCm) |
+| **Calibração de surtos** | `BSS_pos +0,237`, `ECE 0,041`, cobertura `AgACI` `79,4%` (P10–P90) |
+| **Prontidão e filas (`SimPy`)** | `-65%` de eletivas adiadas e pico de fila `20,5 → 1,0` (POA) na fronteira de Pareto |
+| **Benchmark multi-modelo (`v1.3.0`)** | 13 modelos × 4 alvos em **434 s** (4 processos), PDF comparativo com 30 regiões |
+| **Explicabilidade e Bayes (`1.2.6`)** | SHAP 2 estágios com erro aditivo `5,3e-16`; MCMC com `R-hat 1,005` / `ESS 761` |
 
 ---
 
-## 4ª Fase — Roteamento de Bacias Hidrográficas e Demanda Real de Leitos (SIH/SUS vs. CNES-SUS no RS)
+## Início rápido
 
-A auditoria da 3ª fase revelou duas limitações estruturais que motivaram uma quarta etapa focada nos **497 municípios do Rio Grande do Sul** (validação *out-of-time* em 2024):
+Requisitos: **Python 3.12** e [`uv`](https://docs.astral.sh/uv/). CPU é suficiente; GPU
+AMD/NVIDIA é opcional (ROCm/CUDA) e acelera apenas o treino da rede hidrológica e o
+amostrador bayesiano.
 
-- **Ponto cego hidrológico em cidades de jusante:** Tratar municípios isoladamente não capturava cheias em regiões como Porto Alegre e Pelotas, onde o alagamento decorre da água acumulada que desce de bacias a montante.
-- **Rigidez da oferta no CNES e persistência ingênua:** Testes no histórico `2011–2023` mostraram que o cadastro de leitos do CNES tem elasticidade climática praticamente nula (`+0.00000`) em eventos comuns — hospitais absorvem a demanda elevando a taxa de ocupação sem abrir novos leitos no sistema. Além disso, prever o delta mensal usando `lag_1m` real com perda L1 induzia persistência ingênua (curva prevista deslocada 1 mês para a direita).
+```bash
+git clone https://github.com/eduardorwll/Previsao-de-leitos.git
+cd Previsao-de-leitos
 
-### Ferramentas, Arquitetura e Adições de Engenharia
+# ambiente de desenvolvimento (CPU) + extras de ciência de dados
+uv sync --python 3.12 --extra dev --extra data --extra stats --extra sim --extra hydro --extra cpu
 
-- **Roteamento Hidrológico Causal (`HydroFiLMRegionalBasinNet`):** Os 497 municípios do RS foram agrupados em **8 regiões hidrográficas** conectadas por um grafo causal **Montante $\rightarrow$ Jusante** (`shift(1)`). A arquitetura em PyTorch (`Bi-GRU` + `FiLM` condicionado por região/relevo + `Multi-Head Self-Attention` + **Ramo Monotônico Estrutural** via `F.softplus`) passou a receber a chuva acumulada (`7d`, `15d`, `30d`) e o escoamento efetivo das bacias a montante, além da variação barométrica em 3 dias (`pressao_var_3d`, proxy de frentes frias/vento Sul), treinada sobre os decretos completos da SEDEC (sem filtro de chuva local).
-- **Migração para Demanda Real (`SIH/SUS` via BigQuery / `basedosdados`):** A demanda hospitalar passou a ser medida diretamente pelas **diárias de internação do SIH/SUS**, convertidas em leitos necessários sob a taxa de ocupação segura recomendada pela OMS/MS (**85%**):
+# sanidade do ambiente e das bases locais
+uv run previsao-leitos doctor
 
-$$
-\text{Leitos Necessários}_{r,m} = \frac{\text{Diárias de Internação}_{r,m}}{\text{Dias do Mês}_m \times 0{,}85}
-$$
+# bateria de qualidade
+uv run ruff check src tests scripts
+uv run mypy src
+uv run python scripts/check_constraints.py src tests
+uv run pytest -m "not slow" --cov=src/previsao_leitos --cov-fail-under=80
+```
 
-- **Saneamento de Microdados do DATASUS/IBGE:** Foram corrigidos quatro gargalos clássicos no ETL: (1) **deduplicação por `id_aih`** (`SELECT DISTINCT`), eliminando um pico artificial de 2x em agosto/2024 na tabela bruta; (2) **agrupamento por `data_internacao`** (e não pelo mês de faturamento/competência), evitando o deslocamento temporal de AIHs faturadas com atraso; (3) **padronização IBGE de 6 dígitos (`id_mun_6`)** para cruzar SIH e IBGE; e (4) **alinhamento SUS vs. SUS**, filtrando o CNES exclusivamente por `quantidade_sus` (Total e UTI `tipo_leito = 3`) para remover falsos superávits causados por leitos privados.
-- **Modelagem de Demanda (`Ridge` + `StandardScaler`) com Separação de Coortes:** Treinado em `2011–2019` e `2023` (excluindo os anos de pandemia `2020–2022`) e ancorado exclusivamente na base de 2023 (*zero leakage* intra-anual). Foram adicionados parâmetros para capturar a dinâmica real de crises: `sev_log` (resposta côncava), `disrupcao_extrema` (curva em "U invertido" para bloqueio hospitalar), `sev_lag_1m`/`sev_lag_2m` (rebote em 30–60 dias), `sev_vizinhos_max` (transbordamento de pacientes entre regiões adjacentes) e `temp_frio_idx`.
-  - **Coortes de Urgência SUS (Total e UTI) — Formulação Multiplicativa:** Remove cirurgias eletivas (`carater_internacao = 01`) e prevê a variação percentual sobre a base de dezembro do ano anterior
+Com GPU AMD (ROCm 7.2) ou NVIDIA (CUDA 12.8), troque `--extra cpu` por `--extra rocm` ou
+`--extra cuda`. As credenciais opcionais (BigQuery, ANA HidroWeb) ficam em `.env`, nunca no Git.
 
-$$
-\text{Base}_{\text{dez}} \times (1 + \hat{p}).
-$$
+---
 
-  - **Coortes de CIDs Sensíveis a Enchentes (Total e UTI) — Formulação Aditiva/100k:** Filtra Leptospirose (`A27`), hídricas (`A00–A09`, `B15`), respiratórias agudas (`J00–J22`, `J45–J46`), pele (`L00–L08`) e traumas/hipotermia (`S00–T98`), **excluindo Dengue (`A90–A92`)** para evitar contaminação pela epidemia de outono de 2024. Por serem séries esparsas (onde dezembro pode ser `0`), prevê o acréscimo aditivo de leitos por 100 mil habitantes sobre a média do ano anterior, evitando o travamento em zero.
+## Benchmark em um comando
 
-### Resultados — Estágio 1: Alagamento por Região Hidrográfica (RS — Teste Out-of-Time 2024)
+O fluxo completo — treinar, avaliar, comparar e relatar — em dois passos:
 
-| Região Hidrográfica | ROC-AUC | PR-AUC | Brier Score | MAE (% Mun.) |
-| :--- | :---: | :---: | :---: | :---: |
-| **Planalto Norte (Alto Jacuí/Uruguai)** | **0.8562** | **0.7532** | 0.1459 | 2.66% |
-| **Fronteira Oeste e Campanha** | 0.8262 | 0.4518 | **0.1045** | 2.70% |
-| **Depressão Central (Médio Jacuí)** | 0.7948 | 0.6336 | 0.1270 | 2.97% |
-| **Vales (Taquari e Rio Pardo)** | 0.7704 | 0.4283 | 0.1303 | 3.54% |
-| **Serra Gaúcha (Alto Taquari/Caí)** | 0.7357 | 0.5526 | 0.1321 | 2.95% |
-| **Noroeste e Missões** | 0.7333 | 0.5392 | 0.1655 | **2.63%** |
-| **Metropolitana e Bacia do Guaíba** | 0.7216 | 0.5671 | 0.1580 | **2.63%** |
-| **Região Sul e Lagoa dos Patos** | 0.6981 | 0.5701 | 0.1798 | 4.33% |
+```bash
+# 1. monta o painel de modelagem (rede só aqui; grava apenas anos <= 2024)
+uv run --no-sync python scripts/build_rs_modeling_panel.py
 
-### Resultados — Estágio 2: Demanda de Leitos SIH/SUS (2024: Alag. Previsto vs. Alag. Real)
+# 2. roda 13 modelos nos 4 alvos, em paralelo, e emite o PDF comparativo
+uv run --no-sync previsao-leitos run --target all --models all --eval-year 2024 \
+  --run-id rs_v1_3_benchmark_2024 --jobs 4
+```
 
-| Coorte (SIH/SUS — RS 2024) | Formulação | MAE (Alag. Previsto) | $R^2$ (Alag. Previsto) | MAE (Alag. Real) | $R^2$ (Alag. Real) |
-| :--- | :--- | :---: | :---: | :---: | :---: |
-| **Urgência — Total SUS** | Multiplicativa | **159.26 leitos** | **0.9719** | 157.88 leitos | 0.9723 |
-| **Urgência — UTI SUS** | Multiplicativa | **20.09 leitos** | **0.9605** | 20.00 leitos | 0.9605 |
-| **CIDs Enchente — Total SUS** | Aditiva / 100k | **2.49 leitos** | **0.7283** | 2.76 leitos | 0.6586 |
-| **CIDs Enchente — UTI SUS** | Aditiva / 100k | **0.29 leito** | **0.4107** | 0.30 leito | 0.3467 |
+Saídas em `reports/runs/<run-id>/`:
 
-### Principais Achados e Limitações Mapeadas
+| Arquivo | Conteúdo |
+| :--- | :--- |
+| `predictions.parquet` | região × semana × modelo × observado × `P10/P50/P90/P95` |
+| `benchmark.csv` | uma linha por modelo × alvo, com todas as métricas |
+| `comparison.csv` | observado vs. predito por região (viés, MAE, picos), `n ≥ 5` |
+| `decisions.csv` | catraca *Champion–Challenger* por alvo |
+| `eligibility.csv` | quem cumpre cobertura `≥ 80%` e zero violações monotônicas |
+| `fig_regions_<alvo>.png` | grade de 30 regiões: leitos reais vs. previstos |
+| `fig_observed_vs_predicted_<alvo>.png` | série agregada com banda `P10–P90` |
+| `relatorio_benchmark_leitos.pdf` | relatório editorial (espelhado em `~/Downloads/` com SHA-256) |
+| `run_manifest.json` | git SHA, seed, SHA-256 do painel, `jobs`, `sampler`, acelerador |
 
-- **Equivalência Operacional (Rede Neural vs. SEDEC):** Alimentar o modelo de leitos com o alagamento *previsto* pela `HydroFiLMRegionalBasinNet` empatou com o uso dos decretos *reais* da SEDEC nas coortes de Urgência ($R^2 = 0.9719$ vs. $0.9723$) e os superou nas coortes de CIDs ($0.7283$ vs. $0.6586$), permitindo estimar a pressão hospitalar antes da emissão formal dos decretos.
-- **Efeito "Bloqueio e Rebote" (Maio vs. Julho/2024):** As internações gerais no RS caíram **`-12,5%`** em maio (`71.877` $\rightarrow$ `62.903`) devido ao cancelamento de cirurgias eletivas, bloqueio de rodovias e evacuação de hospitais. Isolando apenas **Urgências**, a queda foi de apenas **`-5,1%`**, seguida por um **rebote recorde em julho** (`72.569` internações gerais, `52.021` urgências e `46.505` diárias de UTI), quando a **Depressão Central** atingiu **81,9%** de ocupação da oferta SUS apenas com UTIs de urgência.
-- **Limitações conhecidas:** (1) Ausência de séries de **vento superficial** e **cotas fluviométricas (ANA)**, fatores críticos no represamento da Lagoa dos Patos e do Guaíba; e (2) preenchimento parcial da coluna `cid_principal_categoria` na tabela do BigQuery (`304–465` internações/mês no RS), motivo pelo qual as coortes de **Urgência SUS** constituem o resultado principal da auditoria.
+Opções úteis: `--models champion`, `--models persistencia,gbdt_agaci`, `--target uti_adulto`,
+`--sampler numpyro --device gpu` (amostrador em GPU via JAX), `--no-report`.
 
-> **Conclusão da 4ª Fase:** O acoplamento entre roteamento hidrológico de bacias e demanda real deduplicada do SIH/SUS elimina a persistência ingênua do CNES e demonstra que a rede neural já fornece sinal operacional suficiente para antecipar a pressão sobre leitos SUS (especialmente UTIs de urgência) e dimensionar o rebote pós-enchente.
+---
+
+## Arquitetura
+
+```
+domain → ingestion → geo → hydrology → demand → readiness → audit → cli
+```
+
+| Camada | Responsabilidade |
+| :--- | :--- |
+| **`domain`** | Tipos nominais validados (`CodigoCNES`, `CompetenciaMensal`), hierarquia de exceções |
+| **`ingestion`** | BigQuery parametrizado com *dry-run*, CNES/SIH, clientes NOAA/ANA/MERGE-CPTEC, LGPD |
+| **`geo`** | Grade semanal `0,1°`, DAG de bacias, `W_ref` intermunicipal, anti-*MAUP* |
+| **`hydrology`** | `HydroFiLM-ENSO` com monotonicidade por `autograd`, OOF causal, device ROCm/CUDA/CPU |
+| **`demand`** | `QuantileGBDT`, `NegBinHurdle`, 2 estágios ortogonais, conformais (Flood/AgACI/SPCI), bayes hierárquico |
+| **`readiness`** | Simulador `SimPy` de filas e `NSGA-II` (`pymoo`) para fronteira de Pareto |
+| **`audit`** | Contrafactual BSTS, higiene de dados, SHAP, catraca, dossiê editorial, benchmark |
+| **`cli`** | `doctor`, `verify-rs`, `benchmark`, `run`, `report` |
+
+---
+
+## Tecnologias
+
+![Polars](https://img.shields.io/badge/Polars-1.x-0B5B8C)
+![PyArrow](https://img.shields.io/badge/PyArrow-18%2B-1F4E79)
+![scikit-learn](https://img.shields.io/badge/scikit--learn-1.6%2B-F7931E?logo=scikitlearn&logoColor=white)
+![PyTorch](https://img.shields.io/badge/PyTorch-2.14%20ROCm%2FCUDA-EE4C2C?logo=pytorch&logoColor=white)
+![PyMC](https://img.shields.io/badge/PyMC-6.3-1f425f)
+![nutpie](https://img.shields.io/badge/nutpie-NUTS-4B8BBE)
+![ArviZ](https://img.shields.io/badge/ArviZ-1.3-1f77b4)
+![SimPy](https://img.shields.io/badge/SimPy-event%20sim-6A5ACD)
+![pymoo](https://img.shields.io/badge/pymoo-NSGA--II%2FIII-8B4513)
+![pandera](https://img.shields.io/badge/pandera-validation-2E8B57)
+![pytest](https://img.shields.io/badge/pytest-8-0A9EDC?logo=pytest&logoColor=white)
+
+| Área | Ferramentas |
+| :--- | :--- |
+| Dados | `polars`, `pyarrow`, `pandera`, `google-cloud-bigquery` (Storage API) |
+| Modelagem tabular | `scikit-learn` (GBDT monotônico, Ridge), `statsmodels` |
+| Deep learning | `torch` (ROCm/CUDA/CPU), `lightning`, `torchmetrics` |
+| Bayes | `pymc`, `nutpie`, `arviz` |
+| Simulação e otimização | `simpy`, `pymoo` |
+| Explicabilidade | `shap` (TreeSHAP, 2 estágios) |
+| Qualidade | `ruff`, `mypy` (strict), `pytest`, `pytest-cov`, `pip-audit`, `gitleaks` |
+| Relatórios | HTML5/CSS3 → Chromium headless (PDF editorial, figuras 300 DPI Okabe-Ito) |
+
+---
+
+## Dados, privacidade e holdout
+
+- **Zero PII.** Nenhum CPF, CNS, nome, nascimento ou prontuário é ingerido ou armazenado.
+- **Agregação na fronteira** e **supressão de células com `n < 5`** em toda tabela publicada.
+- **Fontes abertas e oficiais:** CNES, SIH/SUS, IBGE, MapBiomas, ERA5-Land, NASA POWER,
+  MERGE-CPTEC, NOAA CPC, ANA HidroWeb e Zenodo (IPH-UFRGS).
+- **Holdout lacrado.** `2025` (PROBAST+AI) e `2026` (prospectivo virgem) só são avaliados no
+  `Marco M2`; o ano `2025` é fisicamente removido do painel de modelagem e bloqueado na CLI.
+- **Credenciais** (BigQuery, ANA) vivem em `.env` local, fora do Git.
+
+---
+
+## Qualidade e reprodutibilidade
+
+| Gate | Critério |
+| :--- | :--- |
+| `ruff` | lint + regras de segurança (`S`) em `src`, `tests`, `scripts` |
+| `mypy` | tipagem estrita em 100% de `src` |
+| `check_constraints.py` | sem `warnings.filterwarnings("ignore")`, `except: pass`, `allow_pickle`, supressões |
+| `pytest` | `183` testes rápidos, cobertura `84,9%` (piso `80%`) |
+| `C-07` | `import previsao_leitos` sem rede, GPU ou variáveis de ambiente |
+| `pip-audit` / `gitleaks` | zero vulnerabilidades conhecidas e zero segredos no histórico |
+| `uv sync --frozen` | lock reproduzível em CPU (`--extra cpu`) |
+
+Cada execução registra `run_manifest.json` com git SHA, seed, SHA-256 do painel, hash das
+entradas e versões de ambiente.
+
+---
+
+## Documentação
+
+| Documento | Finalidade |
+| :--- | :--- |
+| **[Mapa de Progresso](docs/PROGRESSO.md)** | Etapas, features e status com marcação de progresso |
+| **[Release v1.3.0](docs/RELEASES/v1.3.0.md)** | Notas da release: benchmark, paralelismo e GPU |
+| **[Feature F16 — Benchmark, CLI e Relatório](docs/features/16-benchmark-cli-e-relatorio.md)** | Comando único, métricas, elegibilidade e PDF |
+| **[Feature F15 — SHAP e Bayes Hierárquico](docs/features/15-explicabilidade-shap-bayes.md)** | Explicabilidade auditada e pooling `Região ⊂ Bacia` |
+| **[Feature F14 — Pareto NSGA-II e SimPy](docs/features/14-pareto-nsga2-simpy.md)** | Fronteira de contingência e otimização de filas |
+| **[Feature F13 — Calibração de Surtos](docs/features/13-calibracao-surtos-agaci-spci.md)** | Platt/Beta, `AgACI` vs. `SPCI` |
+| **[Feature F12 — Onda 2B e Grade 0,1°](docs/features/12-onda2b-grade-01deg-f03-diaria.md)** | MERGE-CPTEC, ANA API v2, ablação diária |
+| **[Feature F11 — Onda 2A e F03.1 em GPU](docs/features/11-onda2a-rocm-f03-oof-real.md)** | ROCm, OOF real, `HydroFiLM-ENSO` |
+| **[Feature F10 — Painel v3 (BigQuery)](docs/features/10-painel-v3-bigquery.md)** | Reextração causal do painel semanal |
+| **[Feature F09 — Saneamento V1.2](docs/features/09-saneamento-v1-2-0.md)** | Correção dos bugs estruturais e contrato canônico |
+| **[Features F00–F08](docs/features/)** | Fundação, ingestão, geo, hidrologia, demanda, prontidão, auditoria, CLI e plano V2 |
+| **[Relatório de modelagem (narrativa)](docs/RELATORIO_MODELAGEM_ENCHENTES.md)** | Fases, variáveis e experimentos na visão da equipe de modelagem |
+| **[Catálogo de Dados](docs/data-catalog.md)** | 14 fontes oficiais e critérios de seleção |
+| **[ADRs](docs/adr/)** | Decisões científicas e arquiteturais (`0001`–`0007`) |
+| **[Glossário](GLOSSARY-MAP.md)** | Terminologia canônica por contexto delimitado |
+| **[Padrões de Qualidade](CONSTRAINTS.md)** | Regras mecânicas de engenharia, segurança e privacidade |
+| **[PERF.md](PERF.md)** · **[CHANGELOG.md](CHANGELOG.md)** | Medições antes/depois e histórico de mudanças |
+
+---
+
+## Citação
+
+Se este material apoiar sua pesquisa, cite a release:
+
+```bibtex
+@software{previsao_leitos_2026,
+  title        = {Previsão de Leitos Hospitalares sob Risco de Enchentes},
+  author       = {{Equipe Previsão de Leitos}},
+  year         = {2026},
+  version      = {1.3.0},
+  license      = {MIT},
+  url          = {https://github.com/eduardorwll/Previsao-de-leitos}
+}
+```
+
+Metadados completos em [`CITATION.cff`](CITATION.cff).
+
+---
+
+## Licença
+
+Código sob **MIT** — veja [LICENSE](LICENSE). Dependências mantêm suas próprias licenças
+(`scikit-survival` é GPL-3.0 e está isolado no extra opcional `survival`, com remoção
+planejada na `Task 2.2`).
+
+---
+
+<sub>Projeto de pesquisa aberta. **Not for patient care or live clinical use.** LGPD: zero PII,
+agregação na fronteira, supressão `n < 5`.</sub>
