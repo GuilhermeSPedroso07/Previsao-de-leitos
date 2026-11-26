@@ -1,0 +1,9 @@
+regiao_hidro,data_inicio,data_fim,falha_dique,falha_casa_bombas,municipio_ref,evento,fonte
+Metropolitana e Bacia do Guaíba,2015-10-12,2015-10-20,0,1,Porto Alegre / São Leopoldo,Fechamento de comportas e sobrecarga/desligamento de bombas na cheia do Guaíba e Sinos,Defesa Civil RS / DMAE (out/2015)
+Vales (Taquari e Rio Pardo),2023-09-04,2023-09-10,1,1,Muçum / Roca Sales / Lajeado / Estrela,Galgamento de contenções ribeirinhas e colapso elétrico/bombeamento no Vale do Taquari,Defesa Civil RS / SGB (set/2023)
+Metropolitana e Bacia do Guaíba,2023-09-25,2023-09-30,0,1,Porto Alegre / Eldorado do Sul,Fechamento de comportas do Guaíba e falha parcial em casas de bombas,DMAE / Defesa Civil RS (set/2023)
+Metropolitana e Bacia do Guaíba,2023-11-18,2023-11-25,1,1,Porto Alegre / Canoas / São Leopoldo,Extravasamento em diques secundários e desligamento preventivo de bombeamento,Defesa Civil RS (nov/2023)
+Metropolitana e Bacia do Guaíba,2024-05-03,2024-05-18,1,1,Porto Alegre,Rompimento da Comporta 14 e desligamento/alagamento de casas de bombas do DMAE,DMAE / Defesa Civil Porto Alegre (mai/2024)
+Metropolitana e Bacia do Guaíba,2024-05-04,2024-05-20,1,1,Canoas,Rompimento dos diques Mathias Velho e Rio Branco e submersão das casas de bombas,Prefeitura de Canoas / Defesa Civil RS (mai/2024)
+Metropolitana e Bacia do Guaíba,2024-05-04,2024-05-18,1,1,São Leopoldo,Rompimento do dique da Rua João Corrêa e pane nas casas de bombas (Rodoviária/Ginásio),Prefeitura de São Leopoldo / Defesa Civil RS (mai/2024)
+Região Sul e Lagoa dos Patos,2024-05-08,2024-05-22,1,1,Pelotas / Rio Grande,Extravasamento/ruptura de diques de proteção e sobrecarga/desligamento de bombeamento na Lagoa dos Patos,Defesa Civil RS / Prefeituras de Pelotas e Rio Grande (mai/2024)
