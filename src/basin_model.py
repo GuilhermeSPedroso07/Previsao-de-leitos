@@ -342,8 +342,7 @@ def build_enriched_basin_panel(
 
     if df_wind is not None and not df_wind.empty:
         reg_day = _merge_wind_features(reg_day, df_wind, df_reg)
-        dyn_cols.extend(WIND_DYNAMIC_COLS)
-        print(f"[VENTO BARRA RG] {len(WIND_DYNAMIC_COLS)} variáveis vetoriais integradas ao painel.")
+        print("[VENTO BARRA RG] Represamento costeiro reservado ao Ramo Físico Monotônico (zero ruído na Bi-GRU).")
 
     if df_ana is not None and not df_ana.empty:
         reg_day = _merge_ana_features(reg_day, df_ana, regioes)
@@ -404,6 +403,10 @@ class RegionalBasinDataset(Dataset):
         self.dyn_2d = df[dyn_cols].to_numpy(dtype=np.float32)
         self.stat_2d = df[REG_STATIC_COLS].to_numpy(dtype=np.float32)
         self.reg_1d = df["regiao_hidro"].map(reg_to_idx).fillna(0).to_numpy(dtype=np.int64)
+        if "barra_rg_damming_scaled" in df.columns:
+            self.barra_1d = df["barra_rg_damming_scaled"].to_numpy(dtype=np.float32)
+        else:
+            self.barra_1d = np.zeros(len(df), dtype=np.float32)
         self.ycls_1d = df["alvo_enchente_reg"].to_numpy(dtype=np.int64)
         self.ysev_1d = (df["pct_pop_atingida_real"].to_numpy(dtype=np.float32)) / 10.0
 
@@ -439,26 +442,31 @@ class RegionalBasinDataset(Dataset):
             torch.from_numpy(self.dyn_2d[e - self.seq_len + 1 : e + 1]),
             torch.from_numpy(self.stat_2d[e]),
             torch.tensor(self.reg_1d[e]),
+            torch.tensor(self.barra_1d[e]),
             torch.tensor(self.ycls_1d[e]),
             torch.tensor(self.ysev_1d[e]),
         )
 
 
 class HydroFiLMRegionalBasinNet(nn.Module):
-    """Rede Bi-GRU + FiLM + Multi-Head Attention + Ramo Monotônico Estrutural (Solo e Infra)."""
+    """Rede Bi-GRU + FiLM + Multi-Head Attention + Ramo Monotônico Estrutural (Solo, Infra e Barra RG)."""
 
     def __init__(
         self,
         num_dyn: int,
         rain_3d_idx: int,
+        water_15d_idx: int,
+        local_15d_idx: int,
         num_regions: int,
         hidden_dim: int = 48,
-        dropout: float = 0.25,
+        dropout: float = 0.35,
         dike_idx: Optional[int] = None,
         pump_idx: Optional[int] = None,
     ):
         super().__init__()
         self.rain_3d_idx = rain_3d_idx
+        self.water_15d_idx = water_15d_idx
+        self.local_15d_idx = local_15d_idx
         self.dike_idx = dike_idx
         self.pump_idx = pump_idx
         self.gru = nn.GRU(
@@ -483,14 +491,16 @@ class HydroFiLMRegionalBasinNet(nn.Module):
         self.cls_head = nn.Linear(seq_dim, 1)
         self.sev_head = nn.Sequential(nn.Linear(seq_dim, 1), nn.Softplus())
 
-        # Ramo Monotônico Estrutural (solo + infraestrutura)
+        # Ramo Monotônico Estrutural (solo + infraestrutura + represamento costeiro Barra RG)
         self.raw_w_imp = nn.Parameter(torch.tensor(-1.5))
         self.raw_w_veg = nn.Parameter(torch.tensor(-1.5))
         self.raw_w_int = nn.Parameter(torch.tensor(-2.0))
         self.raw_w_dike = nn.Parameter(torch.tensor(-2.0))
         self.raw_w_pump = nn.Parameter(torch.tensor(-2.0))
+        self.raw_w_barra_cls = nn.Parameter(torch.tensor(-2.0))
+        self.raw_w_barra_sev = nn.Parameter(torch.tensor(-2.5))
 
-    def forward(self, x_dyn, x_stat, reg_idx):
+    def forward(self, x_dyn, x_stat, reg_idx, barra_dam=None):
         h_seq, _ = self.gru(x_dyn)
         geo = torch.cat([self.reg_emb(reg_idx), x_stat[:, 2:5]], dim=-1)
         gamma, beta = torch.chunk(self.film_gen(geo), 2, dim=-1)
@@ -510,7 +520,20 @@ class HydroFiLMRegionalBasinNet(nn.Module):
         if self.pump_idx is not None:
             infra_eff = infra_eff + F.softplus(self.raw_w_pump) * x_dyn[:, -1, self.pump_idx]
 
-        return self.cls_head(h_last).squeeze(-1) + soil_eff + infra_eff, self.sev_head(h_last).squeeze(-1) + infra_eff
+        barra_eff_cls = torch.zeros_like(soil_eff)
+        barra_eff_sev = torch.zeros_like(soil_eff)
+        if barra_dam is not None:
+            water_gate = F.softplus(
+                0.5 * (x_dyn[:, -1, self.water_15d_idx] + x_dyn[:, -1, self.local_15d_idx])
+            )
+            barra_term = barra_dam * water_gate
+            barra_eff_cls = F.softplus(self.raw_w_barra_cls) * barra_term
+            barra_eff_sev = F.softplus(self.raw_w_barra_sev) * barra_term
+
+        return (
+            self.cls_head(h_last).squeeze(-1) + soil_eff + infra_eff + barra_eff_cls,
+            self.sev_head(h_last).squeeze(-1) + infra_eff + barra_eff_sev,
+        )
 
 
 def set_deterministic_seed(seed: int = 42) -> None:
@@ -520,6 +543,59 @@ def set_deterministic_seed(seed: int = 42) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def _run_train_epoch(
+    model: HydroFiLMRegionalBasinNet,
+    loader: DataLoader,
+    opt: torch.optim.Optimizer,
+    sched: torch.optim.lr_scheduler.LRScheduler,
+    huber: nn.Module,
+    device: str,
+) -> float:
+    """Executa uma época de treino com Focal Loss + Huber Loss."""
+    model.train()
+    ep_loss = 0.0
+    for x_dyn, x_stat, reg_idx, barra_dam, y_cls, y_sev in loader:
+        opt.zero_grad()
+        logits, pred_sev = model(
+            x_dyn.to(device),
+            x_stat.to(device),
+            reg_idx.to(device),
+            barra_dam.to(device),
+        )
+        y_c = y_cls.to(device).float()
+        bce = F.binary_cross_entropy_with_logits(logits, y_c, reduction="none")
+        p_t = torch.sigmoid(logits) * y_c + (1 - torch.sigmoid(logits)) * (1 - y_c)
+        focal = ((0.75 * y_c + 0.25 * (1 - y_c)) * ((1 - p_t) ** 2) * bce).mean()
+        loss = focal + 0.50 * huber(pred_sev, y_sev.to(device))
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        opt.step()
+        sched.step()
+        ep_loss += loss.item()
+    return ep_loss / max(1, len(loader))
+
+
+def _predict_dataset(
+    model: HydroFiLMRegionalBasinNet,
+    loader: DataLoader,
+    device: str,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Executa inferência em lote retornando probabilidades e severidade (% pop)."""
+    model.eval()
+    p_list, sev_list = [], []
+    with torch.no_grad():
+        for x_dyn, x_stat, reg_idx, barra_dam, _, _ in loader:
+            logits, pred_sev = model(
+                x_dyn.to(device),
+                x_stat.to(device),
+                reg_idx.to(device),
+                barra_dam.to(device),
+            )
+            p_list.append(torch.sigmoid(logits).cpu().numpy())
+            sev_list.append(np.clip(pred_sev.cpu().numpy() * 10.0, 0.0, 100.0))
+    return np.concatenate(p_list), np.concatenate(sev_list)
 
 
 def train_and_predict_basin_2024(
@@ -532,7 +608,7 @@ def train_and_predict_basin_2024(
     model_load_path: Optional[Path | str] = None,
     seed: int = 42,
 ) -> pd.DataFrame:
-    """Treina (ou carrega checkpoint) a HydroFiLMRegionalBasinNet e avalia out-of-time em 2024."""
+    """Treina (com Early Stopping temporal em 2023) ou carrega checkpoint e avalia em 2024."""
     set_deterministic_seed(seed)
     resolved_device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     cont_dyn_cols = [c for c in dyn_cols if c not in INFRA_BINARY_COLS]
@@ -552,6 +628,10 @@ def train_and_predict_basin_2024(
         dyn_m, dyn_s = ckpt["dyn_m"], ckpt["dyn_s"]
         stat_m, stat_s = ckpt["stat_m"], ckpt["stat_s"]
         dike_idx, pump_idx = ckpt["dike_idx"], ckpt["pump_idx"]
+        barra_scale = float(ckpt.get("barra_scale", 1.0))
+        dropout = float(ckpt.get("dropout", 0.35))
+        water_15d_idx = int(ckpt.get("water_15d_idx", dyn_cols.index("montante_chuva_15d")))
+        local_15d_idx = int(ckpt.get("local_15d_idx", dyn_cols.index("precip_acum_15d")))
     else:
         unique_regs = sorted(df_panel["regiao_hidro"].unique())
         reg_to_idx = {r: i + 1 for i, r in enumerate(unique_regs)}
@@ -569,11 +649,28 @@ def train_and_predict_basin_2024(
         dike_idx = dyn_cols.index("falha_dique") if "falha_dique" in dyn_cols else None
         pump_idx = dyn_cols.index("falha_casa_bombas") if "falha_casa_bombas" in dyn_cols else None
 
-    # Normalização estrita em 2010–2023 (Zero Leakage; nunca aplica z-score em binárias de infra)
+        has_barra_wind = "barra_rg_vento_represamento_3d" in df_panel.columns
+        if has_barra_wind:
+            coastal_tr = df_tr_raw[df_tr_raw["regiao_hidro"].isin(BARRA_RG_COASTAL_REGIONS)]
+            barra_std = float(coastal_tr["barra_rg_vento_represamento_3d"].std()) if not coastal_tr.empty else 1.0
+            barra_scale = max(1.0, barra_std if np.isfinite(barra_std) else 1.0)
+        else:
+            barra_scale = 1.0
+        dropout = 0.35
+        water_15d_idx = dyn_cols.index("montante_chuva_15d")
+        local_15d_idx = dyn_cols.index("precip_acum_15d")
+
+    # Normalização estrita em 2010–2023 (Zero Leakage; preserva zero exato nas binárias e na Barra RG)
     df_norm = df_panel.copy()
     if cont_dyn_cols:
         df_norm[cont_dyn_cols] = (df_panel[cont_dyn_cols] - dyn_m) / dyn_s
     df_norm[REG_STATIC_COLS] = (df_panel[REG_STATIC_COLS] - stat_m) / stat_s
+    if "barra_rg_vento_represamento_3d" in df_panel.columns:
+        df_norm["barra_rg_damming_scaled"] = (
+            np.maximum(0.0, df_panel["barra_rg_vento_represamento_3d"].to_numpy(dtype=np.float32)) / barra_scale
+        ).astype(np.float32)
+    else:
+        df_norm["barra_rg_damming_scaled"] = np.float32(0.0)
 
     # Janela de 21 dias: inicia em 11/12/2023 para prever desde 01/01/2024
     test_24_ds = RegionalBasinDataset(
@@ -584,20 +681,93 @@ def train_and_predict_basin_2024(
     )
     test_loader = DataLoader(test_24_ds, batch_size=512, shuffle=False, num_workers=2)
 
-    model = HydroFiLMRegionalBasinNet(
-        num_dyn=len(dyn_cols),
-        rain_3d_idx=dyn_cols.index("precip_acum_3d"),
-        num_regions=len(reg_to_idx),
-        hidden_dim=48,
-        dropout=0.25,
-        dike_idx=dike_idx,
-        pump_idx=pump_idx,
-    ).to(resolved_device)
+    def _build_model() -> HydroFiLMRegionalBasinNet:
+        return HydroFiLMRegionalBasinNet(
+            num_dyn=len(dyn_cols),
+            rain_3d_idx=dyn_cols.index("precip_acum_3d"),
+            water_15d_idx=water_15d_idx,
+            local_15d_idx=local_15d_idx,
+            num_regions=len(reg_to_idx),
+            hidden_dim=48,
+            dropout=dropout,
+            dike_idx=dike_idx,
+            pump_idx=pump_idx,
+        ).to(resolved_device)
 
     if load_path is not None:
+        model = _build_model()
         model.load_state_dict(ckpt["model_state_dict"])
         print(f"[MODELO] Pesos carregados de: {load_path} (treino ignorado).")
     else:
+        huber = nn.HuberLoss(delta=1.0)
+
+        # Etapa A: Early Stopping temporal em 2023 (treino 2010–2022 -> validação 2023, zero leakage de 2024)
+        val_train_ds = RegionalBasinDataset(df_norm[df_norm["ano"] <= 2022], dyn_cols, reg_to_idx, seq_len=seq_len)
+        val_eval_ds = RegionalBasinDataset(
+            df_norm[(df_norm["data"] >= "2022-12-11") & (df_norm["ano"] <= 2023)],
+            dyn_cols,
+            reg_to_idx,
+            seq_len=seq_len,
+        )
+        val_train_loader = DataLoader(
+            val_train_ds,
+            batch_size=256,
+            shuffle=True,
+            num_workers=2,
+            generator=torch.Generator().manual_seed(seed),
+        )
+        val_eval_loader = DataLoader(val_eval_ds, batch_size=512, shuffle=False, num_workers=2)
+
+        val_model = _build_model()
+        val_opt = torch.optim.AdamW(val_model.parameters(), lr=1.0e-3, weight_decay=5e-3)
+        val_sched = torch.optim.lr_scheduler.OneCycleLR(
+            val_opt, max_lr=1.5e-3, epochs=epochs, steps_per_epoch=len(val_train_loader)
+        )
+
+        best_val_pr = -1.0
+        best_epoch = min(2, epochs)
+        no_improve = 0
+        patience = 3
+
+        print(f"\n--- Validação Temporal 2023 (Early Stopping | dropout={dropout} | weight_decay=5e-3) ---")
+        for ep in range(1, epochs + 1):
+            ep_loss = _run_train_epoch(val_model, val_train_loader, val_opt, val_sched, huber, resolved_device)
+            probs_23, _ = _predict_dataset(val_model, val_eval_loader, resolved_device)
+            df_val_23 = val_eval_ds.meta_df.copy()
+            df_val_23["prob"] = probs_23
+            df_val_23 = df_val_23[df_val_23["ano"] == 2023]
+
+            reg_prs = [
+                average_precision_score(sub["alvo_enchente_reg"], sub["prob"])
+                for _, sub in df_val_23.groupby("regiao_hidro")
+                if len(sub["alvo_enchente_reg"].unique()) > 1
+            ]
+            reg_rocs = [
+                roc_auc_score(sub["alvo_enchente_reg"], sub["prob"])
+                for _, sub in df_val_23.groupby("regiao_hidro")
+                if len(sub["alvo_enchente_reg"].unique()) > 1
+            ]
+            val_pr = float(np.mean(reg_prs)) if reg_prs else 0.0
+            val_roc = float(np.mean(reg_rocs)) if reg_rocs else 0.0
+            print(
+                f"Val Epoch {ep:02d}/{epochs:02d} | Train Loss: {ep_loss:.4f} | "
+                f"Val 2023 PR-AUC: {val_pr:.4f} | Val 2023 ROC-AUC: {val_roc:.4f}"
+            )
+            if ep >= 2 or epochs == 1:
+                if val_pr > best_val_pr:
+                    best_val_pr = val_pr
+                    best_epoch = ep
+                    no_improve = 0
+                else:
+                    no_improve += 1
+                    if no_improve >= patience:
+                        print(f"[EARLY STOPPING] Sem melhora por {patience} épocas; parando na época {ep}.")
+                        break
+
+        print(f"[EARLY STOPPING] Melhor época em 2023: {best_epoch} (PR-AUC médio regional: {best_val_pr:.4f})")
+
+        # Etapa B: Refit final em 2010–2023 por exatamente best_epoch épocas
+        set_deterministic_seed(seed)
         train_ds = RegionalBasinDataset(df_norm[df_norm["ano"] <= 2023], dyn_cols, reg_to_idx, seq_len=seq_len)
         train_loader = DataLoader(
             train_ds,
@@ -606,33 +776,20 @@ def train_and_predict_basin_2024(
             num_workers=2,
             generator=torch.Generator().manual_seed(seed),
         )
-        opt = torch.optim.AdamW(model.parameters(), lr=1.5e-3, weight_decay=1e-3)
-        sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=3e-3, epochs=epochs, steps_per_epoch=len(train_loader))
-        huber = nn.HuberLoss(delta=1.0)
+        model = _build_model()
+        opt = torch.optim.AdamW(model.parameters(), lr=1.0e-3, weight_decay=5e-3)
+        sched = torch.optim.lr_scheduler.OneCycleLR(
+            opt, max_lr=1.5e-3, epochs=best_epoch, steps_per_epoch=len(train_loader)
+        )
 
-        print(f"\n--- Treinando HydroFiLMRegionalBasinNet ({len(dyn_cols)} features dinâmicas | seq_len={seq_len}) ---")
-        for ep in range(1, epochs + 1):
-            model.train()
-            ep_loss = 0.0
-            for x_dyn, x_stat, reg_idx, y_cls, y_sev in train_loader:
-                opt.zero_grad()
-                logits, pred_sev = model(
-                    x_dyn.to(resolved_device),
-                    x_stat.to(resolved_device),
-                    reg_idx.to(resolved_device),
-                )
-                y_c = y_cls.to(resolved_device).float()
-                bce = F.binary_cross_entropy_with_logits(logits, y_c, reduction="none")
-                p_t = torch.sigmoid(logits) * y_c + (1 - torch.sigmoid(logits)) * (1 - y_c)
-                focal = ((0.75 * y_c + 0.25 * (1 - y_c)) * ((1 - p_t) ** 2) * bce).mean()
-                loss = focal + 0.50 * huber(pred_sev, y_sev.to(resolved_device))
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                opt.step()
-                sched.step()
-                ep_loss += loss.item()
-            if ep in (1, 5, epochs):
-                print(f"Epoch {ep:02d}/{epochs:02d} | Loss: {ep_loss / len(train_loader):.4f}")
+        print(
+            f"\n--- Refit Final HydroFiLMRegionalBasinNet ({len(dyn_cols)} features dinâmicas | "
+            f"seq_len={seq_len} | epochs={best_epoch}) ---"
+        )
+        for ep in range(1, best_epoch + 1):
+            ep_loss = _run_train_epoch(model, train_loader, opt, sched, huber, resolved_device)
+            if ep in (1, best_epoch) or ep % 2 == 0:
+                print(f"Refit Epoch {ep:02d}/{best_epoch:02d} | Loss: {ep_loss:.4f}")
 
         if model_save_path is not None:
             save_path = Path(model_save_path)
@@ -649,27 +806,23 @@ def train_and_predict_basin_2024(
                     "stat_s": stat_s,
                     "dike_idx": dike_idx,
                     "pump_idx": pump_idx,
+                    "barra_scale": barra_scale,
+                    "dropout": dropout,
+                    "best_epoch": best_epoch,
+                    "water_15d_idx": water_15d_idx,
+                    "local_15d_idx": local_15d_idx,
+                    "has_barra_wind": has_barra_wind,
                 },
                 save_path,
             )
             print(f"[MODELO] Pesos salvos em: {save_path}")
 
     # Previsão Out-of-Time 2024 (% População Atingida)
-    model.eval()
-    p_list, sev_list = [], []
-    with torch.no_grad():
-        for x_dyn, x_stat, reg_idx, _, _ in test_loader:
-            logits, pred_sev = model(
-                x_dyn.to(resolved_device),
-                x_stat.to(resolved_device),
-                reg_idx.to(resolved_device),
-            )
-            p_list.append(torch.sigmoid(logits).cpu().numpy())
-            sev_list.append(np.clip(pred_sev.cpu().numpy() * 10.0, 0.0, 100.0))
+    probs_24, sevs_24 = _predict_dataset(model, test_loader, resolved_device)
 
     df_pred_24 = test_24_ds.meta_df.copy()
-    df_pred_24["prob_enchente_pred"] = np.concatenate(p_list)
-    df_pred_24["pct_pop_atingida_pred"] = np.concatenate(sev_list)
+    df_pred_24["prob_enchente_pred"] = probs_24
+    df_pred_24["pct_pop_atingida_pred"] = sevs_24
     df_pred_24 = df_pred_24[df_pred_24["ano"] == 2024].copy()
 
     print("\n=== AUDITORIA DE ALAGAMENTO 2024 (% POPULAÇÃO ATINGIDA POR REGIÃO) ===")
