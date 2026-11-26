@@ -42,6 +42,8 @@ def run_rs_urgencia_cids_pipeline_2024(
     use_ana: bool = True,
     use_infra: bool = True,
     infra_csv: Path | str = DATA_DIR / "eventos_infraestrutura_rs.csv",
+    model_save_path: Optional[Path | str] = None,
+    model_load_path: Optional[Path | str] = None,
 ) -> Tuple[pd.DataFrame, Dict[str, pd.DataFrame]]:
     """Executa a auditoria completa out-of-time de 2024 no RS."""
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -81,6 +83,8 @@ def run_rs_urgencia_cids_pipeline_2024(
         epochs=epochs,
         seq_len=21,
         device=device,
+        model_save_path=model_save_path,
+        model_load_path=model_load_path,
     )
     res_demandas = evaluate_separated_demands(
         df_panel=df_panel,
@@ -155,6 +159,18 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Consulta e exibe apenas o boletim atual em tempo real das estações ANA no RS.",
     )
+    parser.add_argument(
+        "--save-model",
+        type=Path,
+        default=None,
+        help="Caminho .pt para salvar os pesos e estatísticas de normalização após o treino.",
+    )
+    parser.add_argument(
+        "--load-model",
+        type=Path,
+        default=None,
+        help="Caminho .pt de checkpoint salvo para rodar inferência sem retreinar a rede neural.",
+    )
     return parser.parse_args()
 
 
@@ -179,4 +195,6 @@ if __name__ == "__main__":
             use_ana=not args.no_ana,
             use_infra=not args.no_infra,
             infra_csv=args.infra_csv,
+            model_save_path=args.save_model,
+            model_load_path=args.load_model,
         )

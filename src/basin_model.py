@@ -495,79 +495,123 @@ def train_and_predict_basin_2024(
     epochs: int = 10,
     seq_len: int = 21,
     device: Optional[str] = None,
+    model_save_path: Optional[Path | str] = None,
+    model_load_path: Optional[Path | str] = None,
 ) -> pd.DataFrame:
-    """Treina a HydroFiLMRegionalBasinNet em 2010–2023 e avalia out-of-time em 2024."""
+    """Treina (ou carrega checkpoint) a HydroFiLMRegionalBasinNet e avalia out-of-time em 2024."""
     resolved_device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-    unique_regs = sorted(df_panel["regiao_hidro"].unique())
-    reg_to_idx = {r: i + 1 for i, r in enumerate(unique_regs)}
+    cont_dyn_cols = [c for c in dyn_cols if c not in INFRA_BINARY_COLS]
+    load_path = Path(model_load_path) if model_load_path is not None else None
+
+    if load_path is not None:
+        if not load_path.exists():
+            raise FileNotFoundError(f"Checkpoint do modelo não encontrado em: {load_path}")
+        ckpt = torch.load(load_path, map_location=resolved_device, weights_only=False)
+        if ckpt["dyn_cols"] != dyn_cols:
+            raise ValueError(
+                "As colunas dinâmicas do checkpoint diferem das atuais "
+                "(verifique as flags --no-wind / --no-ana / --no-infra)."
+            )
+        reg_to_idx = ckpt["reg_to_idx"]
+        seq_len = int(ckpt["seq_len"])
+        dyn_m, dyn_s = ckpt["dyn_m"], ckpt["dyn_s"]
+        stat_m, stat_s = ckpt["stat_m"], ckpt["stat_s"]
+        dike_idx, pump_idx = ckpt["dike_idx"], ckpt["pump_idx"]
+    else:
+        unique_regs = sorted(df_panel["regiao_hidro"].unique())
+        reg_to_idx = {r: i + 1 for i, r in enumerate(unique_regs)}
+        df_tr_raw = df_panel[df_panel["ano"] <= 2023]
+        if cont_dyn_cols:
+            dyn_m = df_tr_raw[cont_dyn_cols].mean().to_numpy()
+            raw_std = df_tr_raw[cont_dyn_cols].std().to_numpy()
+            dyn_s = np.where(raw_std >= 1e-6, raw_std, 1.0)
+        else:
+            dyn_m = np.array([], dtype=np.float32)
+            dyn_s = np.array([], dtype=np.float32)
+        stat_m = df_tr_raw[REG_STATIC_COLS].mean().to_numpy()
+        raw_stat_std = df_tr_raw[REG_STATIC_COLS].std().to_numpy()
+        stat_s = np.where(raw_stat_std >= 1e-6, raw_stat_std, 1.0)
+        dike_idx = dyn_cols.index("falha_dique") if "falha_dique" in dyn_cols else None
+        pump_idx = dyn_cols.index("falha_casa_bombas") if "falha_casa_bombas" in dyn_cols else None
 
     # Normalização estrita em 2010–2023 (Zero Leakage; nunca aplica z-score em binárias de infra)
-    df_tr_raw = df_panel[df_panel["ano"] <= 2023]
-    cont_dyn_cols = [c for c in dyn_cols if c not in INFRA_BINARY_COLS]
     df_norm = df_panel.copy()
-
     if cont_dyn_cols:
-        dyn_m = df_tr_raw[cont_dyn_cols].mean().to_numpy()
-        raw_std = df_tr_raw[cont_dyn_cols].std().to_numpy()
-        dyn_s = np.where(raw_std >= 1e-6, raw_std, 1.0)
         df_norm[cont_dyn_cols] = (df_panel[cont_dyn_cols] - dyn_m) / dyn_s
-
-    stat_m = df_tr_raw[REG_STATIC_COLS].mean().to_numpy()
-    raw_stat_std = df_tr_raw[REG_STATIC_COLS].std().to_numpy()
-    stat_s = np.where(raw_stat_std >= 1e-6, raw_stat_std, 1.0)
     df_norm[REG_STATIC_COLS] = (df_panel[REG_STATIC_COLS] - stat_m) / stat_s
 
     # Janela de 21 dias: inicia em 11/12/2023 para prever desde 01/01/2024
-    train_ds = RegionalBasinDataset(df_norm[df_norm["ano"] <= 2023], dyn_cols, reg_to_idx, seq_len=seq_len)
     test_24_ds = RegionalBasinDataset(
         df_norm[(df_norm["data"] >= "2023-12-11") & (df_norm["ano"] <= 2024)],
         dyn_cols,
         reg_to_idx,
         seq_len=seq_len,
     )
-
-    train_loader = DataLoader(train_ds, batch_size=256, shuffle=True, num_workers=2)
     test_loader = DataLoader(test_24_ds, batch_size=512, shuffle=False, num_workers=2)
-
-    dike_idx = dyn_cols.index("falha_dique") if "falha_dique" in dyn_cols else None
-    pump_idx = dyn_cols.index("falha_casa_bombas") if "falha_casa_bombas" in dyn_cols else None
 
     model = HydroFiLMRegionalBasinNet(
         num_dyn=len(dyn_cols),
         rain_3d_idx=dyn_cols.index("precip_acum_3d"),
-        num_regions=len(unique_regs),
+        num_regions=len(reg_to_idx),
         hidden_dim=48,
         dropout=0.25,
         dike_idx=dike_idx,
         pump_idx=pump_idx,
     ).to(resolved_device)
-    opt = torch.optim.AdamW(model.parameters(), lr=1.5e-3, weight_decay=1e-3)
-    sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=3e-3, epochs=epochs, steps_per_epoch=len(train_loader))
-    huber = nn.HuberLoss(delta=1.0)
 
-    print(f"\n--- Treinando HydroFiLMRegionalBasinNet ({len(dyn_cols)} features dinâmicas | seq_len={seq_len}) ---")
-    for ep in range(1, epochs + 1):
-        model.train()
-        ep_loss = 0.0
-        for x_dyn, x_stat, reg_idx, y_cls, y_sev in train_loader:
-            opt.zero_grad()
-            logits, pred_sev = model(
-                x_dyn.to(resolved_device),
-                x_stat.to(resolved_device),
-                reg_idx.to(resolved_device),
+    if load_path is not None:
+        model.load_state_dict(ckpt["model_state_dict"])
+        print(f"[MODELO] Pesos carregados de: {load_path} (treino ignorado).")
+    else:
+        train_ds = RegionalBasinDataset(df_norm[df_norm["ano"] <= 2023], dyn_cols, reg_to_idx, seq_len=seq_len)
+        train_loader = DataLoader(train_ds, batch_size=256, shuffle=True, num_workers=2)
+        opt = torch.optim.AdamW(model.parameters(), lr=1.5e-3, weight_decay=1e-3)
+        sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=3e-3, epochs=epochs, steps_per_epoch=len(train_loader))
+        huber = nn.HuberLoss(delta=1.0)
+
+        print(f"\n--- Treinando HydroFiLMRegionalBasinNet ({len(dyn_cols)} features dinâmicas | seq_len={seq_len}) ---")
+        for ep in range(1, epochs + 1):
+            model.train()
+            ep_loss = 0.0
+            for x_dyn, x_stat, reg_idx, y_cls, y_sev in train_loader:
+                opt.zero_grad()
+                logits, pred_sev = model(
+                    x_dyn.to(resolved_device),
+                    x_stat.to(resolved_device),
+                    reg_idx.to(resolved_device),
+                )
+                y_c = y_cls.to(resolved_device).float()
+                bce = F.binary_cross_entropy_with_logits(logits, y_c, reduction="none")
+                p_t = torch.sigmoid(logits) * y_c + (1 - torch.sigmoid(logits)) * (1 - y_c)
+                focal = ((0.75 * y_c + 0.25 * (1 - y_c)) * ((1 - p_t) ** 2) * bce).mean()
+                loss = focal + 0.50 * huber(pred_sev, y_sev.to(resolved_device))
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                opt.step()
+                sched.step()
+                ep_loss += loss.item()
+            if ep in (1, 5, epochs):
+                print(f"Epoch {ep:02d}/{epochs:02d} | Loss: {ep_loss / len(train_loader):.4f}")
+
+        if model_save_path is not None:
+            save_path = Path(model_save_path)
+            save_path.parent.mkdir(parents=True, exist_ok=True)
+            torch.save(
+                {
+                    "model_state_dict": model.state_dict(),
+                    "dyn_cols": dyn_cols,
+                    "reg_to_idx": reg_to_idx,
+                    "seq_len": seq_len,
+                    "dyn_m": dyn_m,
+                    "dyn_s": dyn_s,
+                    "stat_m": stat_m,
+                    "stat_s": stat_s,
+                    "dike_idx": dike_idx,
+                    "pump_idx": pump_idx,
+                },
+                save_path,
             )
-            y_c = y_cls.to(resolved_device).float()
-            bce = F.binary_cross_entropy_with_logits(logits, y_c, reduction="none")
-            p_t = torch.sigmoid(logits) * y_c + (1 - torch.sigmoid(logits)) * (1 - y_c)
-            focal = ((0.75 * y_c + 0.25 * (1 - y_c)) * ((1 - p_t) ** 2) * bce).mean()
-            loss = focal + 0.50 * huber(pred_sev, y_sev.to(resolved_device))
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            opt.step()
-            sched.step()
-            ep_loss += loss.item()
-        if ep in (1, 5, epochs):
-            print(f"Epoch {ep:02d}/{epochs:02d} | Loss: {ep_loss / len(train_loader):.4f}")
+            print(f"[MODELO] Pesos salvos em: {save_path}")
 
     # Previsão Out-of-Time 2024 (% População Atingida)
     model.eval()
