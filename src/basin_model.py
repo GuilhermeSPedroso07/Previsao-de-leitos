@@ -1,6 +1,7 @@
 """Estágio 1: Engenharia hidrológica regional, roteamento Montante->Jusante e HydroFiLMRegionalBasinNet."""
 
 from pathlib import Path
+import random
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -71,15 +72,25 @@ BASE_DYNAMIC_COLS: List[str] = [
     "doy_cos",
 ]
 
-WIND_DYNAMIC_COLS: List[str] = [
+REGIONAL_WIND_COLS: List[str] = [
     "vento_velocidade_ms",
     "vento_rajada_max_ms",
     "vento_sul_ms",
     "vento_oeste_ms",
+]
+
+BARRA_RG_WIND_COLS: List[str] = [
     "barra_rg_vento_represamento_ms",
     "barra_rg_vento_represamento_3d",
     "barra_rg_vento_escoamento_ms",
 ]
+
+WIND_DYNAMIC_COLS: List[str] = REGIONAL_WIND_COLS + BARRA_RG_WIND_COLS
+
+BARRA_RG_COASTAL_REGIONS = {
+    "Região Sul e Lagoa dos Patos",
+    "Metropolitana e Bacia do Guaíba",
+}
 
 ANA_DYNAMIC_COLS: List[str] = [
     "cota_max_cm",
@@ -145,7 +156,16 @@ def _merge_wind_features(reg_day: pd.DataFrame, df_wind: pd.DataFrame, df_reg: p
         reg_day["barra_rg_vento_escoamento_ms"] = 0.0
 
     for col in WIND_DYNAMIC_COLS:
-        reg_day[col] = reg_day.groupby("regiao_hidro")[col].ffill().bfill().fillna(0.0)
+        reg_day[col] = (
+            reg_day.groupby("regiao_hidro")[col]
+            .transform(lambda s: s.ffill(limit=3).bfill(limit=3))
+            .fillna(0.0)
+        )
+
+    # Máscara física costeira: o represamento da Barra de Rio Grande só atua na Lagoa dos Patos e Guaíba
+    non_coastal_mask = ~reg_day["regiao_hidro"].isin(BARRA_RG_COASTAL_REGIONS)
+    for col in BARRA_RG_WIND_COLS:
+        reg_day.loc[non_coastal_mask, col] = 0.0
     return reg_day
 
 
@@ -191,6 +211,7 @@ def build_enriched_basin_panel(
     df_wind: Optional[pd.DataFrame] = None,
     df_ana: Optional[pd.DataFrame] = None,
     df_infra_daily: Optional[pd.DataFrame] = None,
+    include_infra_in_stage1: bool = False,
 ) -> Tuple[pd.DataFrame, List[str]]:
     """Constrói painel diário regional com roteamento causal e alvo ponderado por população."""
     df_c = pd.read_parquet(climate_parquet)
@@ -331,8 +352,11 @@ def build_enriched_basin_panel(
 
     if df_infra_daily is not None and not df_infra_daily.empty:
         reg_day = _merge_infra_features(reg_day, df_infra_daily)
-        dyn_cols.extend(INFRA_BINARY_COLS)
-        print(f"[INFRA] Indicadores binários integrados: {INFRA_BINARY_COLS}")
+        if include_infra_in_stage1:
+            dyn_cols.extend(INFRA_BINARY_COLS)
+            print(f"[INFRA] Indicadores binários integrados no Estágio 1 e Estágio 2: {INFRA_BINARY_COLS}")
+        else:
+            print(f"[INFRA] Indicadores binários reservados ao Estágio 2 (sem atalho no Estágio 1): {INFRA_BINARY_COLS}")
 
     # Alvo ponderado por população (elimina viés de municípios rurais vs. metrópoles)
     df_pop = pd.read_parquet(cnes_area_parquet)
@@ -489,6 +513,15 @@ class HydroFiLMRegionalBasinNet(nn.Module):
         return self.cls_head(h_last).squeeze(-1) + soil_eff + infra_eff, self.sev_head(h_last).squeeze(-1) + infra_eff
 
 
+def set_deterministic_seed(seed: int = 42) -> None:
+    """Fixa sementes determinísticas para reprodutibilidade entre execuções."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
 def train_and_predict_basin_2024(
     df_panel: pd.DataFrame,
     dyn_cols: List[str],
@@ -497,8 +530,10 @@ def train_and_predict_basin_2024(
     device: Optional[str] = None,
     model_save_path: Optional[Path | str] = None,
     model_load_path: Optional[Path | str] = None,
+    seed: int = 42,
 ) -> pd.DataFrame:
     """Treina (ou carrega checkpoint) a HydroFiLMRegionalBasinNet e avalia out-of-time em 2024."""
+    set_deterministic_seed(seed)
     resolved_device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     cont_dyn_cols = [c for c in dyn_cols if c not in INFRA_BINARY_COLS]
     load_path = Path(model_load_path) if model_load_path is not None else None
@@ -564,7 +599,13 @@ def train_and_predict_basin_2024(
         print(f"[MODELO] Pesos carregados de: {load_path} (treino ignorado).")
     else:
         train_ds = RegionalBasinDataset(df_norm[df_norm["ano"] <= 2023], dyn_cols, reg_to_idx, seq_len=seq_len)
-        train_loader = DataLoader(train_ds, batch_size=256, shuffle=True, num_workers=2)
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=256,
+            shuffle=True,
+            num_workers=2,
+            generator=torch.Generator().manual_seed(seed),
+        )
         opt = torch.optim.AdamW(model.parameters(), lr=1.5e-3, weight_decay=1e-3)
         sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=3e-3, epochs=epochs, steps_per_epoch=len(train_loader))
         huber = nn.HuberLoss(delta=1.0)

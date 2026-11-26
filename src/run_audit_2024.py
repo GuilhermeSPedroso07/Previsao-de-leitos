@@ -44,13 +44,15 @@ def run_rs_urgencia_cids_pipeline_2024(
     infra_csv: Path | str = DATA_DIR / "eventos_infraestrutura_rs.csv",
     model_save_path: Optional[Path | str] = None,
     model_load_path: Optional[Path | str] = None,
+    infra_in_stage1: bool = False,
+    seed: int = 42,
 ) -> Tuple[pd.DataFrame, Dict[str, pd.DataFrame]]:
     """Executa a auditoria completa out-of-time de 2024 no RS."""
     device = "cuda" if torch.cuda.is_available() else "cpu"
     project_id = get_gcp_project_id()
     print(
         f"[DISPOSITIVO] {device.upper()} | Auditoria RS 2024 "
-        f"(Vento={use_wind} | ANA={use_ana} | Infra={use_infra})"
+        f"(Vento={use_wind} | ANA={use_ana} | Infra={use_infra} | InfraStage1={infra_in_stage1} | Seed={seed})"
     )
 
     df_reg = fetch_rs_hydro_regions(project_id)
@@ -76,6 +78,7 @@ def run_rs_urgencia_cids_pipeline_2024(
         df_wind=df_wind,
         df_ana=df_ana,
         df_infra_daily=df_infra_daily,
+        include_infra_in_stage1=infra_in_stage1,
     )
     df_pred_24 = train_and_predict_basin_2024(
         df_panel=df_panel,
@@ -85,6 +88,7 @@ def run_rs_urgencia_cids_pipeline_2024(
         device=device,
         model_save_path=model_save_path,
         model_load_path=model_load_path,
+        seed=seed,
     )
     res_demandas = evaluate_separated_demands(
         df_panel=df_panel,
@@ -171,6 +175,17 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="Caminho .pt de checkpoint salvo para rodar inferência sem retreinar a rede neural.",
     )
+    parser.add_argument(
+        "--infra-in-stage1",
+        action="store_true",
+        help="Inclui flags binárias de diques/bombas também no Estágio 1 (útil para simulações what-if).",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Semente determinística para treino e embaralhamento (padrão 42).",
+    )
     return parser.parse_args()
 
 
@@ -197,4 +212,6 @@ if __name__ == "__main__":
             infra_csv=args.infra_csv,
             model_save_path=args.save_model,
             model_load_path=args.load_model,
+            infra_in_stage1=args.infra_in_stage1,
+            seed=args.seed,
         )
