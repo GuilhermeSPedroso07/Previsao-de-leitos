@@ -128,7 +128,7 @@ def load_infra_events_daily(
     path = ensure_infra_events_csv(csv_path)
     df_ev = pd.read_csv(path)
 
-    all_dates = pd.DatetimeIndex(pd.to_datetime(dates).normalize().unique()).sort_values()
+    all_dates = pd.DatetimeIndex(pd.to_datetime(dates)).normalize().unique().sort_values()
     full_idx = pd.MultiIndex.from_product([sorted(regioes), all_dates], names=["regiao_hidro", "data"])
     daily = pd.DataFrame(index=full_idx).reset_index()
     daily["falha_dique"] = np.float32(0.0)
